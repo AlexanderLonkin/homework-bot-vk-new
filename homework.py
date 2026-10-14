@@ -3,6 +3,7 @@ import os
 import random
 import sys
 import time
+from http import HTTPStatus
 
 import requests
 import vk_api
@@ -32,8 +33,7 @@ HOMEWORK_VERDICTS = {
 def check_tokens():
     """Проверить обязательные переменные окружения перед запуском.
 
-    Вернуть True, если все переменные заданы. При отсутствии хотя бы
-    одной записать CRITICAL и завершить программу с кодом 1.
+    Вернуть True, если все переменные заданы, иначе False.
     """
     required_tokens = {
         'PRACTICUM_TOKEN': PRACTICUM_TOKEN,
@@ -41,13 +41,7 @@ def check_tokens():
         'VK_USER_ID': VK_USER_ID,
     }
     missing = [name for name, value in required_tokens.items() if not value]
-    if missing:
-        logging.critical(
-            'Отсутствуют обязательные переменные: %s', ', '.join(missing)
-        )
-        sys.exit(1)
-    logging.info('Все обязательные переменные найдены.')
-    return True
+    return not missing
 
 
 def send_message(vk, message):
@@ -75,10 +69,13 @@ def get_api_answer(timestamp):
     """Получить ответ API со статусами начиная с timestamp в Unix time.
 
     Передать OAuth-токен и параметр from_date, вернуть разобранный JSON.
-    При сетевой ошибке или HTTP-коде, отличном от 200, вызвать RuntimeError;
-    при некорректном JSON вызвать ValueError.
+    При сетевой ошибке вызвать RuntimeError. При HTTP-коде, отличном от
+    HTTPStatus.OK, или некорректном JSON вызвать ValueError.
     """
     params = {'from_date': int(timestamp)}
+    logging.debug(
+        'Начало запроса к API: адрес=%s, параметры=%s', ENDPOINT, params
+    )
     try:
         response = requests.get(
             url=ENDPOINT, headers=HEADERS, params=params, timeout=5
@@ -87,35 +84,38 @@ def get_api_answer(timestamp):
         raise RuntimeError(
             f'Ошибка запроса к API Практикума: {type(error).__name__}'
         ) from error
-    if response.status_code != 200:
-        raise RuntimeError(
+    if response.status_code != HTTPStatus.OK:
+        raise ValueError(
             f'API Практикума вернул HTTP {response.status_code}.'
         )
-    try:
-        return response.json()
-    except ValueError as error:
-        raise ValueError('Ответ API не является валидным JSON.') from error
+    data = response.json()
+    logging.debug(
+        'Запрос к API успешно завершён: адрес=%s, параметры=%s',
+        ENDPOINT, params
+    )
+    return data
 
 
 def check_response(response):
     """Проверить структуру ответа API и вернуть список домашних работ.
 
-    Проверить ключи homeworks и current_date и типы их значений.
+    Проверить наличие ключа homeworks и тип его значения.
     При отсутствии ключа вызвать KeyError, при неверном типе — TypeError.
-    Для пустого списка работ записать DEBUG.
     """
+    logging.debug('Начало проверки ответа сервера.')
     if not isinstance(response, dict):
-        raise TypeError('Ответ API должен быть словарём.')
-    for key in ('homeworks', 'current_date'):
-        if key not in response:
-            raise KeyError(f'В ответе API отсутствует ключ {key}.')
+        raise TypeError(
+            f'Ответ API должен быть словарём, получен тип {type(response)}.'
+        )
+    if 'homeworks' not in response:
+        raise KeyError('В ответе API отсутствует ключ homeworks.')
     homeworks = response['homeworks']
     if not isinstance(homeworks, list):
-        raise TypeError('Значение homeworks должно быть списком.')
-    if type(response['current_date']) is not int:
-        raise TypeError('Значение current_date должно быть Unix time.')
-    if not homeworks:
-        logging.debug("Новых работ не найдено в ответе API.")
+        raise TypeError(
+            'Значение homeworks должно быть списком, '
+            f'получен тип {type(homeworks)}.'
+        )
+    logging.debug('Проверка ответа сервера успешно завершена.')
     return homeworks
 
 
@@ -126,6 +126,7 @@ def parse_status(homework):
     При неверном типе вызвать TypeError, при отсутствии обязательного
     ключа — KeyError, при неизвестном статусе — ValueError.
     """
+    logging.debug('Начало проверки статуса домашней работы.')
     if not isinstance(homework, dict):
         raise TypeError('Домашняя работа должна быть словарём.')
     for key in ('homework_name', 'status'):
@@ -142,45 +143,55 @@ def parse_status(homework):
     if comment:
         clean_comment = comment.replace('\n', ' ')
         message += f'Комментарий ревьюера: {clean_comment}\n'
-    return message + HOMEWORK_VERDICTS[status]
+    message += HOMEWORK_VERDICTS[status]
+    logging.debug('Проверка статуса домашней работы успешно завершена.')
+    return message
 
 
 def main():
     """Запустить опрос API каждые RETRY_PERIOD секунд и уведомления в VK.
 
-    Проверить окружение и создать VK-клиент. Обновлять время выборки после
-    успешной отправки всех статусов. Логировать каждую ошибку, отправляя
-    уведомление о ней один раз до следующего успешного цикла.
+    Проверить окружение и создать VK-клиент. Обрабатывать первую работу
+    и обновлять время выборки после успешного цикла. Логировать каждую
+    ошибку и сравнивать её сообщение с последним отправленным, чтобы
+    не повторять уведомления.
     """
-    check_tokens()
+    if not check_tokens():
+        logging.critical(
+            'Отсутствует хотя бы одна обязательная переменная окружения.'
+        )
+        sys.exit(1)
+    logging.info('Все обязательные переменные найдены.')
     vk_session = vk_api.VkApi(token=VK_TOKEN)
     vk = vk_session.get_api()
     last_timestamp = int(time.time()) - 3600
     logging.info("Бот запущен и начал мониторинг статусов...")
-    reported_errors = set()
-    sent_messages = set()
+    last_error_message = ''
 
     while True:
         try:
             response = get_api_answer(last_timestamp)
             homeworks = check_response(response)
-            for homework in homeworks:
-                message = parse_status(homework)
-                if message not in sent_messages:
-                    if send_message(vk, message) is False:
-                        break
-                    sent_messages.add(message)
+            notification_sent = True
+            if not homeworks:
+                logging.debug('Статус домашней работы не изменился.')
             else:
-                last_timestamp = response['current_date']
-                sent_messages.clear()
-                reported_errors.clear()
+                homework = homeworks[0]
+                message = parse_status(homework)
+                notification_sent = send_message(vk, message) is not False
+            if notification_sent:
+                last_timestamp = (
+                    response.get('current_date') or int(time.time())
+                )
+                last_error_message = ''
         except Exception as error:
             message = f'Ошибка работы бота: {error}'
             logging.error(message)
-            if message not in reported_errors:
-                if send_message(vk, message) is not False:
-                    reported_errors.add(message)
-        time.sleep(RETRY_PERIOD)
+            if (message != last_error_message
+                    and send_message(vk, message) is not False):
+                last_error_message = message
+        finally:
+            time.sleep(RETRY_PERIOD)
 
 
 if __name__ == '__main__':
