@@ -10,11 +10,6 @@ import vk_api
 from dotenv import load_dotenv
 
 load_dotenv()
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    handlers=[logging.StreamHandler(sys.stdout)],
-)
 
 
 PRACTICUM_TOKEN = os.getenv('PRACTICUM_TOKEN')
@@ -58,7 +53,7 @@ def send_message(vk, message):
         )
     except Exception as error:
         logging.error(
-            'Ошибка отправки сообщения в VK: %s', type(error).__name__
+            f'Ошибка отправки сообщения в VK: {type(error).__name__}'
         )
         return False
     logging.debug('Сообщение успешно отправлено в VK.')
@@ -88,12 +83,11 @@ def get_api_answer(timestamp):
         raise ValueError(
             f'API Практикума вернул HTTP {response.status_code}.'
         )
-    data = response.json()
     logging.debug(
         'Запрос к API успешно завершён: адрес=%s, параметры=%s',
         ENDPOINT, params
     )
-    return data
+    return response.json()
 
 
 def check_response(response):
@@ -128,7 +122,10 @@ def parse_status(homework):
     """
     logging.debug('Начало проверки статуса домашней работы.')
     if not isinstance(homework, dict):
-        raise TypeError('Домашняя работа должна быть словарём.')
+        raise TypeError(
+            'Домашняя работа должна быть словарём, '
+            f'получен тип {type(homework)}.'
+        )
     for key in ('homework_name', 'status'):
         if key not in homework:
             raise KeyError(f'В домашней работе отсутствует ключ {key}.')
@@ -178,7 +175,7 @@ def main():
             else:
                 homework = homeworks[0]
                 message = parse_status(homework)
-                notification_sent = send_message(vk, message) is not False
+                notification_sent = send_message(vk, message)
             if notification_sent:
                 last_timestamp = (
                     response.get('current_date') or int(time.time())
@@ -188,11 +185,16 @@ def main():
             message = f'Ошибка работы бота: {error}'
             logging.error(message)
             if (message != last_error_message
-                    and send_message(vk, message) is not False):
+                    and send_message(vk, message)):
                 last_error_message = message
         finally:
             time.sleep(RETRY_PERIOD)
 
 
 if __name__ == '__main__':
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        handlers=[logging.StreamHandler(sys.stdout)],
+    )
     main()
